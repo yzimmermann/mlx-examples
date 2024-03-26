@@ -17,8 +17,11 @@ from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizer
 
+from .sample_utils import top_p_sampling
+
 # Local imports
 from .tuner.utils import apply_lora_layers
+from .tuner.utils import dequantize as dequantize_model
 
 # Constants
 MODEL_REMAPPING = {
@@ -143,23 +146,7 @@ def generate_step(
             token = mx.argmax(logits, axis=-1)
         else:
             if top_p > 0 and top_p < 1.0:
-                if (
-                    logits.dtype == mx.bfloat16
-                ):  # workdaround for unable to load kernel contiguous_scan_inclusive_sum_bfloat16_bfloat16
-                    logits = logits.astype(mx.float32)
-                probs = mx.softmax(logits / temp, axis=-1)
-
-                sorted_probs = mx.sort(probs)[::-1]
-                sorted_indices = mx.argsort(probs)[::-1]
-                cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-
-                top_probs = mx.where(
-                    cumulative_probs > 1 - top_p,
-                    sorted_probs,
-                    mx.zeros_like(sorted_probs),
-                )
-                sorted_token = mx.random.categorical(mx.log(top_probs))
-                token = sorted_indices.squeeze(0)[sorted_token]
+                token = top_p_sampling(logits, top_p, temp)
             else:
                 token = mx.random.categorical(logits * (1 / temp))
 
@@ -237,6 +224,7 @@ def generate(
 
     tic = time.perf_counter()
     tokens = []
+    token_strings = []
     skip = 0
     REPLACEMENT_CHAR = "\ufffd"
 
@@ -263,15 +251,20 @@ def generate(
             if formatter:
                 formatter(s[skip:], prob.item())
                 skip = len(s)
-            elif REPLACEMENT_CHAR not in s:
+            elif s[-1] != REPLACEMENT_CHAR:
                 print(s[skip:], end="", flush=True)
                 skip = len(s)
+            # Reset token cache at line break
+            if s[-1] == "\n":
+                tokens = []
+                token_strings.append(s)
+                skip = 0
 
-    token_count = len(tokens)
-    token_string = tokenizer.decode(tokens).replace(REPLACEMENT_CHAR, "")
+    token_count = n + 1
+    token_strings.append(tokenizer.decode(tokens).replace(REPLACEMENT_CHAR, ""))
 
     if verbose:
-        print(token_string[skip:], flush=True)
+        print(token_strings[-1][skip:], flush=True)
         gen_time = time.perf_counter() - tic
         print("=" * 10)
         if token_count == 0:
@@ -282,7 +275,7 @@ def generate(
         print(f"Prompt: {prompt_tps:.3f} tokens-per-sec")
         print(f"Generation: {gen_tps:.3f} tokens-per-sec")
 
-    return token_string
+    return "".join(token_strings)
 
 
 def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
@@ -440,12 +433,14 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     from huggingface_hub import HfApi, ModelCard, logging
 
+    from . import __version__
+
     card = ModelCard.load(hf_path)
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
     card.text = dedent(
         f"""
         # {upload_repo}
-        This model was converted to MLX format from [`{hf_path}`]().
+        This model was converted to MLX format from [`{hf_path}`]() using mlx-lm version **{__version__}**.
         Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
         ## Use with mlx
 
@@ -585,6 +580,7 @@ def convert(
     dtype: str = "float16",
     upload_repo: str = None,
     revision: Optional[str] = None,
+    dequantize: bool = False,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -594,10 +590,18 @@ def convert(
     dtype = mx.float16 if quantize else getattr(mx, dtype)
     weights = {k: v.astype(dtype) for k, v in weights.items()}
 
+    if quantize and dequantize:
+        raise ValueError("Choose either quantize or dequantize, not both.")
+
     if quantize:
         print("[INFO] Quantizing")
         model.load_weights(list(weights.items()))
         weights, config = quantize_model(model, config, q_group_size, q_bits)
+
+    if dequantize:
+        print("[INFO] Dequantizing")
+        model = dequantize_model(model)
+        weights = dict(tree_flatten(model.parameters()))
 
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)

@@ -189,7 +189,6 @@ def train(
 
     state = [model.state, optimizer.state]
 
-    @partial(mx.compile, inputs=state, outputs=state)
     def step(batch):
         # Forward and backward pass
         (lvalue, toks), grad = loss_value_and_grad(model, *batch)
@@ -224,7 +223,7 @@ def train(
         n_tokens += toks.item()
 
         # Report training loss if needed
-        if (it + 1) % args.steps_per_report == 0:
+        if ((it + 1) % args.steps_per_report == 0) or (it + 1 == args.iters):
             train_loss = np.mean(losses)
 
             stop = time.perf_counter()
@@ -259,7 +258,7 @@ def train(
             start = time.perf_counter()
 
         # Report validation loss if needed
-        if it == 0 or (it + 1) % args.steps_per_eval == 0:
+        if it == 0 or ((it + 1) % args.steps_per_eval == 0) or (it + 1 == args.iters):
             stop = time.perf_counter()
             val_loss = evaluate(
                 model=model,
